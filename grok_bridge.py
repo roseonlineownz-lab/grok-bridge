@@ -7,9 +7,7 @@ import json
 import os
 import re
 import signal
-import socketserver
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -51,8 +49,11 @@ def _clean_response(text: str) -> str:
         idx = text.rfind(marker)
         if idx != -1:
             text = text[:idx]
-    # Timing indicators like \n3.2s\n
+    # Timing indicators like \n3.2s\n or \n717ms\n
     text = re.sub(r"\n[0-9]+(\.[0-9]+)?s\n", "\n", text)
+    text = re.sub(r"\n[0-9]+ms\n", "\n", text)
+    text = re.sub(r"\n[0-9]+(\.[0-9]+)?s$", "", text)
+    text = re.sub(r"\n[0-9]+ms$", "", text)
     # Action buttons
     text = re.sub(r"\n(Share|Compare|Make it|Explain|Toggle|Like|Dislike).*", "", text)
     # Collapse excessive newlines
@@ -65,14 +66,22 @@ class GrokBridge:
 
     def __init__(self, headless: bool = False):
         os.makedirs(USER_DATA_DIR, exist_ok=True)
-        self._lock = threading.Lock()
         self._pw = sync_playwright().start()
         try:
             self._context = self._pw.chromium.launch_persistent_context(
                 user_data_dir=USER_DATA_DIR,
                 channel="chrome",
                 headless=headless,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
             )
+            # Remove navigator.webdriver flag that Cloudflare detects
+            for page in self._context.pages:
+                page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            self._context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         except Exception as exc:
             self._pw.stop()
             print(
@@ -203,35 +212,31 @@ class GrokBridge:
 
     def chat(self, prompt: str, timeout: float = 120) -> dict:
         """Send a prompt and return the response."""
-        with self._lock:
-            self._ensure_grok()
-            _el, selector = self._find_input()
-            self._type_and_send(selector, prompt)
-            return self._poll_response(prompt, timeout)
+        self._ensure_grok()
+        _el, selector = self._find_input()
+        self._type_and_send(selector, prompt)
+        return self._poll_response(prompt, timeout)
 
     def health(self) -> dict:
         """Return current browser state."""
-        with self._lock:
-            url = self._page.url
-            return {
-                "status": "ok",
-                "url": url,
-                "on_grok": url.startswith(GROK_URL),
-                "version": VERSION,
-            }
+        url = self._page.url
+        return {
+            "status": "ok",
+            "url": url,
+            "on_grok": url.startswith(GROK_URL),
+            "version": VERSION,
+        }
 
     def history(self) -> dict:
         """Return the current page text content."""
-        with self._lock:
-            body = self._page.evaluate("() => document.body.innerText")
-            return {"status": "ok", "content": _clean_response(body), "raw_length": len(body)}
+        body = self._page.evaluate("() => document.body.innerText")
+        return {"status": "ok", "content": _clean_response(body), "raw_length": len(body)}
 
     def new_conversation(self) -> dict:
         """Navigate to grok.com for a fresh conversation."""
-        with self._lock:
-            self._page.goto(GROK_URL, wait_until="domcontentloaded")
-            self._page.wait_for_timeout(2000)
-            return {"status": "ok"}
+        self._page.goto(GROK_URL, wait_until="domcontentloaded")
+        self._page.wait_for_timeout(2000)
+        return {"status": "ok"}
 
     def close(self) -> None:
         """Shut down browser and Playwright."""
@@ -318,9 +323,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._json_response(500, {"status": "error", "error": str(exc)})
 
 
-class _ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+class _Server(http.server.HTTPServer):
     allow_reuse_address = True
-    daemon_threads = True
 
 
 # ======================================================================
@@ -360,7 +364,7 @@ def _server_mode(host: str, port: int, headless: bool) -> None:
     signal.signal(signal.SIGTERM, _shutdown)
 
     _Handler.bridge = bridge
-    server = _ThreadedServer((host, port), _Handler)
+    server = _Server((host, port), _Handler)
     print(f"grok-bridge {VERSION} listening on {host}:{port}", file=sys.stderr)
     try:
         server.serve_forever()
