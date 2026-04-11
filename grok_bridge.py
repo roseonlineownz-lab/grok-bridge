@@ -215,7 +215,9 @@ class GrokBridge:
             if elapsed >= timeout:
                 body = self._page.evaluate("() => document.body.innerText")
                 partial = self._extract(body, marker)
-                return {"status": "timeout", "response": partial, "elapsed": round(elapsed, 1)}
+                sources, source_count = self._extract_sources(body)
+                return {"status": "timeout", "response": partial, "elapsed": round(elapsed, 1),
+                        "sources": sources, "source_count": source_count}
 
             self._page.wait_for_timeout(2000)
             body = self._page.evaluate("() => document.body.innerText")
@@ -228,8 +230,10 @@ class GrokBridge:
 
             if stable_count >= 3:
                 response = self._extract(body, marker)
+                sources, source_count = self._extract_sources(body)
                 elapsed = time.time() - start
-                return {"status": "ok", "response": response, "elapsed": round(elapsed, 1)}
+                return {"status": "ok", "response": response, "elapsed": round(elapsed, 1),
+                        "sources": sources, "source_count": source_count}
 
     @staticmethod
     def _extract(body: str, marker: str) -> str:
@@ -237,6 +241,35 @@ class GrokBridge:
         parts = body.split(marker, 1)
         raw = parts[-1] if len(parts) > 1 else body
         return _clean_response(raw)
+
+    def _extract_sources(self, body: str) -> tuple[list[dict], int]:
+        """Extract source links from DOM and parse source count from text."""
+        # Get links from DOM
+        raw_links = self._page.evaluate("""() => {
+            const links = Array.from(document.querySelectorAll('a[href]'));
+            return links
+                .filter(a => {
+                    const h = a.href;
+                    return h.startsWith('http')
+                        && !h.includes('grok.com')
+                        && !h.includes('cookiepedia')
+                        && !h.includes('onetrust');
+                })
+                .map(a => ({url: a.href, text: (a.textContent || '').trim().substring(0, 80)}));
+        }""")
+        # Deduplicate by URL
+        seen = set()
+        sources = []
+        for link in raw_links:
+            if link["url"] not in seen:
+                seen.add(link["url"])
+                sources.append(link)
+        # Parse source count from body text
+        source_count = 0
+        m = re.search(r"(\d+)\s*sources?", body, re.IGNORECASE)
+        if m:
+            source_count = int(m.group(1))
+        return sources, source_count
 
     # ------------------------------------------------------------------
     # Public API
@@ -249,7 +282,10 @@ class GrokBridge:
             self._select_mode(mode)
         _el, selector = self._find_input()
         self._type_and_send(selector, prompt)
-        return self._poll_response(prompt, timeout)
+        result = self._poll_response(prompt, timeout)
+        result["query"] = prompt
+        result["mode"] = mode
+        return result
 
     def health(self) -> dict:
         """Return current browser state."""
