@@ -28,6 +28,7 @@ SEND_SELECTORS = [
     'button[aria-label="Send"]',
     'button[data-testid="send-button"]',
 ]
+VALID_MODES = {"auto", "fast", "expert", "heavy"}
 
 # UI artifacts to strip from responses
 TRAILING_MARKERS = [
@@ -38,7 +39,13 @@ TRAILING_MARKERS = [
     "\nAttach",
     "\nGrok",
     "\nFast\n",
+    "\nFast",
     "\nAuto\n",
+    "\nAuto",
+    "\nExpert\n",
+    "\nExpert",
+    "\nHeavy\n",
+    "\nHeavy",
     "\nUpgrade to",
 ]
 
@@ -54,6 +61,8 @@ def _clean_response(text: str) -> str:
     text = re.sub(r"\n[0-9]+ms\n", "\n", text)
     text = re.sub(r"\n[0-9]+(\.[0-9]+)?s$", "", text)
     text = re.sub(r"\n[0-9]+ms$", "", text)
+    # "Thought for Xs" prefix from Expert/Heavy mode
+    text = re.sub(r"^\s*Thought for [0-9]+s\s*\n*", "", text)
     # Action buttons
     text = re.sub(r"\n(Share|Compare|Make it|Explain|Toggle|Like|Dislike).*", "", text)
     # Collapse excessive newlines
@@ -101,6 +110,29 @@ class GrokBridge:
         if not url.startswith(GROK_URL):
             self._page.goto(GROK_URL, wait_until="domcontentloaded")
             self._page.wait_for_timeout(2000)
+
+    def _select_mode(self, mode: str) -> None:
+        """Select a Grok mode (auto/fast/expert/heavy) via the Model select dropdown."""
+        # Open the model select dropdown with pointer events (click alone doesn't work)
+        self._page.evaluate("""() => {
+            const btn = document.querySelector('button[aria-label="Model select"]');
+            if (!btn) return;
+            btn.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true}));
+            btn.dispatchEvent(new PointerEvent('pointerup', {bubbles: true}));
+            btn.click();
+        }""")
+        self._page.wait_for_timeout(500)
+        # Click the matching menu item
+        mode_lower = mode.lower()
+        clicked = self._page.evaluate("""(mode) => {
+            const items = Array.from(document.querySelectorAll('[role=menu] [role=menuitem]'));
+            const target = items.find(i => i.textContent.trim().toLowerCase().startsWith(mode));
+            if (target) { target.click(); return true; }
+            return false;
+        }""", mode_lower)
+        if not clicked:
+            raise RuntimeError(f"Could not find mode '{mode}' in dropdown")
+        self._page.wait_for_timeout(300)
 
     def _find_input(self):
         """Locate the message input element. Returns (element, selector)."""
@@ -210,9 +242,11 @@ class GrokBridge:
     # Public API
     # ------------------------------------------------------------------
 
-    def chat(self, prompt: str, timeout: float = 120) -> dict:
+    def chat(self, prompt: str, timeout: float = 120, mode: str | None = None) -> dict:
         """Send a prompt and return the response."""
         self._ensure_grok()
+        if mode:
+            self._select_mode(mode)
         _el, selector = self._find_input()
         self._type_and_send(selector, prompt)
         return self._poll_response(prompt, timeout)
@@ -237,6 +271,11 @@ class GrokBridge:
         self._page.goto(GROK_URL, wait_until="domcontentloaded")
         self._page.wait_for_timeout(2000)
         return {"status": "ok"}
+
+    def evaluate(self, js: str) -> dict:
+        """Run arbitrary JS in the page and return the result."""
+        result = self._page.evaluate(js)
+        return {"status": "ok", "result": result}
 
     def close(self) -> None:
         """Shut down browser and Playwright."""
@@ -293,6 +332,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._handle_chat()
         elif self.path == "/new":
             self._handle_new()
+        elif self.path == "/eval":
+            self._handle_eval()
         else:
             self._json_response(404, {"status": "error", "error": "not found"})
 
@@ -309,8 +350,30 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._json_response(400, {"status": "error", "error": "missing or invalid 'prompt' field"})
             return
         timeout = data.get("timeout", 120)
+        mode = data.get("mode")
+        if mode and mode not in VALID_MODES:
+            self._json_response(400, {"status": "error", "error": f"invalid mode '{mode}', must be one of: {', '.join(sorted(VALID_MODES))}"})
+            return
         try:
-            result = self.bridge.chat(prompt, timeout=timeout)
+            result = self.bridge.chat(prompt, timeout=timeout, mode=mode)
+            self._json_response(200, result)
+        except Exception as exc:
+            self._json_response(500, {"status": "error", "error": str(exc)})
+
+    def _handle_eval(self) -> None:
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b""
+        try:
+            data = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            self._json_response(400, {"status": "error", "error": "invalid JSON"})
+            return
+        js = data.get("js")
+        if not js or not isinstance(js, str):
+            self._json_response(400, {"status": "error", "error": "missing 'js' field"})
+            return
+        try:
+            result = self.bridge.evaluate(js)
             self._json_response(200, result)
         except Exception as exc:
             self._json_response(500, {"status": "error", "error": str(exc)})
