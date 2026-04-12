@@ -1,7 +1,7 @@
 ---
 title: "feat: Return structured sources and metadata from /chat"
 type: feat
-status: active
+status: completed
 date: 2026-04-11
 ---
 

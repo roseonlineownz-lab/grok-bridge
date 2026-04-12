@@ -9,6 +9,7 @@ import re
 import signal
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout, Error as PwError
@@ -242,6 +243,19 @@ class GrokBridge:
         raw = parts[-1] if len(parts) > 1 else body
         return _clean_response(raw)
 
+    @staticmethod
+    def _snowflake_to_iso(status_id: str) -> str | None:
+        """Convert an X/Twitter snowflake status ID to ISO 8601 timestamp."""
+        try:
+            sid = int(status_id)
+            ts_ms = (sid >> 22) + 1288834974657
+            dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except (ValueError, OSError):
+            return None
+
+    _X_STATUS_RE = re.compile(r"x\.com/.+/status/(\d+)")
+
     def _extract_sources(self, body: str) -> tuple[list[dict], int]:
         """Extract source links from DOM and parse source count from text."""
         # Get links from DOM
@@ -257,13 +271,24 @@ class GrokBridge:
                 })
                 .map(a => ({url: a.href, text: (a.textContent || '').trim().substring(0, 80)}));
         }""")
-        # Deduplicate by URL
+        # Deduplicate by URL, add timestamp for X posts
         seen = set()
         sources = []
         for link in raw_links:
-            if link["url"] not in seen:
-                seen.add(link["url"])
-                sources.append(link)
+            url = link["url"]
+            # Strip grok referrer param for cleaner URLs
+            clean_url = re.sub(r"\?referrer=grok-com$", "", url)
+            if clean_url in seen:
+                continue
+            seen.add(clean_url)
+            entry = {"url": clean_url, "text": link["text"]}
+            # Extract timestamp from X snowflake ID
+            m = self._X_STATUS_RE.search(clean_url)
+            if m:
+                ts = self._snowflake_to_iso(m.group(1))
+                if ts:
+                    entry["timestamp"] = ts
+            sources.append(entry)
         # Parse source count from body text
         source_count = 0
         m = re.search(r"(\d+)\s*sources?", body, re.IGNORECASE)
