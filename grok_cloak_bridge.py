@@ -25,13 +25,18 @@ PROFILE_DIR = os.path.expanduser("~/.nova/grok_cloak")
 CHROME_PROFILE_SRC = "/mnt/c/Users/roseo/AppData/Local/Google/Chrome/User Data/Default"
 os.makedirs(PROFILE_DIR, exist_ok=True)
 
-# Extra Chromium args to prevent crash-recovery dialog (breaks headless login)
+# Extra Chromium args: prevent crash-recovery dialog + reduce renderer memory (OOM-resilient)
 EXTRA_ARGS = [
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-session-crashed-bubble",
     "--restore-last-session=false",
     "--hide-crash-restore-bubble",
+    # Memory pressure mitigation — host RAM is tight, keep renderer from OOM-crashing
+    "--js-flags=--max-old-space-size=512",
+    "--renderer-process-limit=1",
+    "--disable-background-timer-throttling",
+    "--memory-pressure-off",
 ]
 
 
@@ -77,18 +82,76 @@ def _clear_crash_recovery():
 
 class GrokCloak:
     def __init__(self, headless=True):
+        self._headless = headless
+        self._last_login_check = 0
+        self._launch()
+
+    def _launch(self):
+        """Launch (or relaunch) the persistent browser context and primary page."""
         _clear_crash_recovery()
         _import_chrome_cookies()
-        print(f"[CloakBrowser] Launching — headless={headless}", file=sys.stderr)
+        print(f"[CloakBrowser] Launching — headless={self._headless}", file=sys.stderr)
+        # Optional egress proxy (e.g. residential SOCKS exit to pass Cloudflare on a
+        # datacenter host). Set GROK_PROXY=socks5://127.0.0.1:1080 to route browser traffic.
+        proxy = os.environ.get("GROK_PROXY") or None
+        if proxy:
+            print(f"[proxy] Routing browser via {proxy}", file=sys.stderr)
         self._ctx = launch_persistent_context(
             PROFILE_DIR,
-            headless=headless,
+            headless=self._headless,
             humanize=True,
             args=EXTRA_ARGS,
+            proxy=proxy,
         )
         self._page = self._ctx.new_page()
         self._last_login_check = 0
-        self._auto_login_if_needed()
+        # Lightweight init: verify SSO cookies WITHOUT loading the heavy grok.com SPA.
+        # Loading grok.com at startup OOM-crashes the renderer on RAM-tight hosts;
+        # the actual navigation is deferred to the first chat() via _ensure_grok().
+        self._verify_session_cookies()
+
+    def _verify_session_cookies(self):
+        """Cheap login check: inspect persisted cookies, no page navigation."""
+        try:
+            cookies = self._ctx.cookies("https://grok.com")
+            sso = [c for c in cookies if c.get("name") in ("sso", "sso-rw")]
+            if sso:
+                print("[login] SSO cookies present — session ready (deferred nav)", file=sys.stderr)
+            else:
+                print("[login] No SSO cookies — manual --login may be needed", file=sys.stderr)
+        except Exception as e:
+            print(f"[login] cookie check skipped: {e}", file=sys.stderr)
+
+    def _is_alive(self):
+        """Return True if the page/context is still usable."""
+        try:
+            if self._page.is_closed():
+                return False
+            # Cheap probe — raises if renderer is dead
+            self._page.evaluate("() => 1")
+            return True
+        except Exception:
+            return False
+
+    def _recover(self):
+        """Rebuild the browser after a renderer crash. Best-effort cleanup then relaunch."""
+        print("[recover] Page crashed — rebuilding browser", file=sys.stderr)
+        try:
+            self._ctx.close()
+        except Exception:
+            pass
+        # Kill any stale chrome holding the profile, then relaunch
+        try:
+            import subprocess
+            subprocess.run(
+                [os.path.join(os.path.dirname(__file__), "cleanup_grok_profile.sh")],
+                timeout=15,
+            )
+        except Exception as e:
+            print(f"[recover] cleanup failed: {e}", file=sys.stderr)
+        time.sleep(2)
+        self._launch()
+        print("[recover] Browser rebuilt", file=sys.stderr)
 
     def _auto_login_if_needed(self):
         """Navigate to grok.com and check login state. React needs time to hydrate — wait properly."""
@@ -197,6 +260,23 @@ class GrokCloak:
             return False
 
     def chat(self, prompt: str, mode: str = "auto") -> dict:
+        """Crash-resilient wrapper: detect renderer crash, rebuild browser, retry once."""
+        for attempt in range(2):
+            try:
+                if not self._is_alive():
+                    self._recover()
+                return self._chat_impl(prompt, mode)
+            except Exception as e:
+                msg = str(e)
+                crashed = "Target crashed" in msg or "Target closed" in msg or "has been closed" in msg
+                if crashed and attempt == 0:
+                    print(f"[chat] crash detected ({msg[:80]}) — recovering", file=sys.stderr)
+                    self._recover()
+                    continue
+                return {"status": "error", "error": msg[:300]}
+        return {"status": "error", "error": "chat failed after recovery"}
+
+    def _chat_impl(self, prompt: str, mode: str = "auto") -> dict:
         self._ensure_grok()
 
         # Inject fetch interceptor to capture streaming response
@@ -204,6 +284,10 @@ class GrokCloak:
             () => {
                 window.__grok_response = '';
                 window.__grok_done = false;
+                // Install the fetch interceptor only ONCE per page — re-injecting on every
+                // chat() call stacks wrappers and captures each token N times (triplication).
+                if (window.__grok_hooked) { return; }
+                window.__grok_hooked = true;
                 const origFetch = window.fetch;
                 window.fetch = async function(...args) {
                     const resp = await origFetch(...args);
@@ -228,7 +312,13 @@ class GrokCloak:
                                                    || d?.token
                                                    || d?.choices?.[0]?.delta?.content
                                                    || '';
-                                            if (t) window.__grok_response += t;
+                                            // Skip thinking-trace placeholder and consecutive
+                                            // duplicate tokens (Grok emits each token twice).
+                                            if (t && t !== window.__grok_last
+                                                  && t.indexOf('Thinking about your request') === -1) {
+                                                window.__grok_response += t;
+                                                window.__grok_last = t;
+                                            }
                                         } catch(e) {}
                                     });
                                 }
@@ -251,7 +341,26 @@ class GrokCloak:
         if not box:
             return {"status": "error", "error": "Input not found — not logged in?"}
 
-        box.click()
+        # Dismiss any overlay/banner that may cover the input (e.g. "Grok Build" promo)
+        try:
+            for close_sel in ['button[aria-label="Close"]', 'button[aria-label="Dismiss"]',
+                              '[data-testid="dismiss"]', 'button:has-text("×")']:
+                ov = self._page.query_selector(close_sel)
+                if ov:
+                    ov.click()
+                    self._page.wait_for_timeout(300)
+        except Exception:
+            pass
+
+        # Robust focus+type: force-click past overlays, fall back to JS focus
+        try:
+            box.click(force=True, timeout=5000)
+        except Exception:
+            try:
+                box.scroll_into_view_if_needed(timeout=3000)
+                self._page.evaluate("(el) => el.focus()", box)
+            except Exception:
+                pass
         box.type(prompt, delay=25)
         self._page.keyboard.press("Enter")
 
@@ -495,6 +604,7 @@ def server_mode(host: str, port: int, headless: bool):
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
+    HTTPServer.allow_reuse_address = True  # survive fast restarts (TIME_WAIT)
     srv = HTTPServer((host, port), _Handler)
     print(f"grok-cloak-bridge {VERSION} listening on {host}:{port}", file=sys.stderr)
     srv.serve_forever()
