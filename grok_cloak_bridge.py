@@ -18,63 +18,104 @@ except ImportError:
     print("[FATAL] cloakbrowser or playwright not found", file=sys.stderr)
     sys.exit(1)
 
-VERSION = "v3-cloak"
+VERSION = "v4-cloak"
 GROK_URL = "https://grok.com"
 PROFILE_DIR = os.path.expanduser("~/.nova/grok_cloak")
 # Chrome Default profile from WSL path (roseonlineownz Google login)
 CHROME_PROFILE_SRC = "/mnt/c/Users/roseo/AppData/Local/Google/Chrome/User Data/Default"
 os.makedirs(PROFILE_DIR, exist_ok=True)
 
+# Extra Chromium args to prevent crash-recovery dialog (breaks headless login)
+EXTRA_ARGS = [
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-session-crashed-bubble",
+    "--restore-last-session=false",
+    "--hide-crash-restore-bubble",
+]
+
 
 def _import_chrome_cookies():
-    """Copy Chrome cookies from Windows Default profile into CloakBrowser profile.
-    Only copies if the CloakBrowser profile has no valid session yet.
-    """
+    """Copy Chrome cookies on first run only. Windows cookies are DPAPI-encrypted and can't be
+    decrypted on Linux — only copy if the profile has no cookies yet (bootstrap only)."""
     src = Path(CHROME_PROFILE_SRC)
     dst = Path(PROFILE_DIR)
     if not src.exists():
         print("[login] Chrome profile not found at expected path, skipping import", file=sys.stderr)
         return False
 
-    # Copy cookies file (Chrome SQLite3 format — CloakBrowser/Chromium can read it)
     cookies_src = src / "Cookies"
     cookies_dst = dst / "Default" / "Cookies"
     cookies_dst.parent.mkdir(parents=True, exist_ok=True)
 
+    # Only copy if destination missing — Linux Chromium session cookies must NOT be overwritten
     if cookies_src.exists() and not cookies_dst.exists():
         try:
             shutil.copy2(str(cookies_src), str(cookies_dst))
-            print(f"[login] Imported Chrome cookies → {cookies_dst}", file=sys.stderr)
+            print(f"[login] Bootstrap: copied Chrome cookies → {cookies_dst}", file=sys.stderr)
             return True
         except Exception as e:
-            print(f"[login] Cookie import failed: {e}", file=sys.stderr)
+            print(f"[login] Cookie copy failed: {e}", file=sys.stderr)
     return False
+
+
+def _clear_crash_recovery():
+    """Remove Chromium crash/session files that trigger restore dialog in headless mode."""
+    import glob
+    for pattern in [
+        f"{PROFILE_DIR}/Default/Last Session",
+        f"{PROFILE_DIR}/Default/Last Tabs",
+        f"{PROFILE_DIR}/Default/Current Session",
+        f"{PROFILE_DIR}/Default/Current Tabs",
+    ]:
+        for f in glob.glob(pattern):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
 
 
 class GrokCloak:
     def __init__(self, headless=True):
+        _clear_crash_recovery()
         _import_chrome_cookies()
         print(f"[CloakBrowser] Launching — headless={headless}", file=sys.stderr)
         self._ctx = launch_persistent_context(
             PROFILE_DIR,
             headless=headless,
             humanize=True,
+            args=EXTRA_ARGS,
         )
         self._page = self._ctx.new_page()
+        self._last_login_check = 0
         self._auto_login_if_needed()
 
     def _auto_login_if_needed(self):
-        """Navigate to grok.com and attempt Google auto-login if not already logged in."""
+        """Navigate to grok.com and check login state. React needs time to hydrate — wait properly."""
         try:
             self._page.goto(GROK_URL, wait_until="domcontentloaded", timeout=20000)
-            self._page.wait_for_timeout(2500)
+            # Wait for React hydration — poll up to 10s in 1s steps
+            for _ in range(10):
+                self._page.wait_for_timeout(1000)
+                if self.is_logged_in():
+                    break
 
             if self.is_logged_in():
                 print("[login] Already logged in", file=sys.stderr)
                 return
 
-            # Look for Google sign-in button
-            print("[login] Not logged in — attempting Google auto-login...", file=sys.stderr)
+            # Check if we have SSO cookies — if so, treat as logged in (cookie auth)
+            try:
+                cookies = self._ctx.cookies()
+                sso_cookies = [c for c in cookies if c.get("name") in ("sso", "sso-rw") and "x.ai" in c.get("domain", "")]
+                if sso_cookies:
+                    print("[login] SSO cookies present — treating as logged in (cookie auth)", file=sys.stderr)
+                    return
+            except Exception:
+                pass
+
+            # Try clicking Google sign-in button (only works in headed mode)
+            print("[login] No SSO cookies — attempting Google sign-in...", file=sys.stderr)
             for sel in [
                 'text=Sign in with Google',
                 'text=Continue with Google',
@@ -85,10 +126,9 @@ class GrokCloak:
                 if btn:
                     btn.click()
                     self._page.wait_for_timeout(3000)
-                    # If Google account picker appears, select roseonlineownz
                     for acct_sel in [
-                        f'text=roseonlineownz',
-                        f'[data-email*="roseonlineownz"]',
+                        'text=roseonlineownz',
+                        '[data-email*="roseonlineownz"]',
                         'div[data-identifier*="roseonlineownz"]',
                     ]:
                         acct = self._page.query_selector(acct_sel)
@@ -98,28 +138,62 @@ class GrokCloak:
                             break
                     break
 
-            # Wait for redirect back to grok.com
-            for _ in range(12):
+            for _ in range(6):
                 self._page.wait_for_timeout(2000)
                 if self._page.url.startswith(GROK_URL) and self.is_logged_in():
-                    print("[login] Auto-login succeeded", file=sys.stderr)
+                    print("[login] Sign-in succeeded", file=sys.stderr)
                     return
 
-            print("[login] Auto-login incomplete — may need manual login once", file=sys.stderr)
+            # Proceed anyway — headless Google OAuth won't work, but cookies might
+            print("[login] Sign-in incomplete — proceeding with existing cookies", file=sys.stderr)
         except Exception as e:
-            print(f"[login] Auto-login error: {e}", file=sys.stderr)
+            print(f"[login] Login check error: {e}", file=sys.stderr)
 
     def _ensure_grok(self):
         if not self._page.url.startswith(GROK_URL):
             self._page.goto(GROK_URL, wait_until="domcontentloaded", timeout=15000)
             self._page.wait_for_timeout(2000)
+        # Re-check login every 10 minutes
+        now = time.time()
+        if now - self._last_login_check > 600:
+            self._last_login_check = now
+            if not self.is_logged_in():
+                print("[login] Session expired — re-attempting login", file=sys.stderr)
+                self._auto_login_if_needed()
 
     def is_logged_in(self):
         try:
-            return self._page.query_selector(
-                '[data-testid="userAvatar"], [aria-label="User menu"], text=New Chat'
-            ) is not None
-        except:
+            # Multiple fallback checks — Grok UI changes selectors frequently
+            url = self._page.url or ""
+            if "accounts.x.ai" in url or "login" in url.lower():
+                return False
+            checks = [
+                '[data-testid="userAvatar"]',
+                '[aria-label="User menu"]',
+                'a[href*="/i/user"]',
+                'nav a[href="/"]',  # sidebar nav present = logged in
+                'button:has-text("New Chat")',
+                'a:has-text("New Chat")',
+                'text=New Chat',
+                'text=SuperGrok',
+                '[data-testid="sidebar"]',
+            ]
+            for sel in checks:
+                try:
+                    el = self._page.query_selector(sel)
+                    if el:
+                        return True
+                except Exception:
+                    continue
+            # Fallback: check page text for logged-in indicators
+            try:
+                content = self._page.evaluate("() => document.body.innerText.slice(0, 2000)")
+                if any(kw in content for kw in ["New Chat", "SuperGrok", "Imagine", "Build"]):
+                    return True
+            except Exception:
+                pass
+            return False
+        except Exception:
             return False
 
     def chat(self, prompt: str, mode: str = "auto") -> dict:
