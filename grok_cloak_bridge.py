@@ -7,8 +7,8 @@ NovaMaster Grok Bridge — CloakBrowser edition v3
 - Persistent CloakBrowser profile at ~/.nova/grok_cloak/
 """
 
-import os, sys, json, signal, argparse, time, base64, shutil
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import os, sys, json, signal, argparse, time, base64, shutil, threading
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 try:
@@ -84,6 +84,11 @@ class GrokCloak:
     def __init__(self, headless=True):
         self._headless = headless
         self._last_login_check = 0
+        self._lock = threading.RLock()
+        self._busy_since = None
+        self._last_error = None
+        self._last_url = "about:blank"
+        self._cookie_session_ready = False
         self._launch()
 
     def _launch(self):
@@ -104,6 +109,8 @@ class GrokCloak:
             proxy=proxy,
         )
         self._page = self._ctx.new_page()
+        self._page.set_default_timeout(int(os.environ.get("GROK_PLAYWRIGHT_TIMEOUT_MS", "12000")))
+        self._page.set_default_navigation_timeout(int(os.environ.get("GROK_NAVIGATION_TIMEOUT_MS", "20000")))
         self._last_login_check = 0
         # Lightweight init: verify SSO cookies WITHOUT loading the heavy grok.com SPA.
         # Loading grok.com at startup OOM-crashes the renderer on RAM-tight hosts;
@@ -115,12 +122,21 @@ class GrokCloak:
         try:
             cookies = self._ctx.cookies("https://grok.com")
             sso = [c for c in cookies if c.get("name") in ("sso", "sso-rw")]
+            self._cookie_session_ready = bool(sso)
             if sso:
                 print("[login] SSO cookies present — session ready (deferred nav)", file=sys.stderr)
             else:
                 print("[login] No SSO cookies — manual --login may be needed", file=sys.stderr)
         except Exception as e:
+            self._cookie_session_ready = False
             print(f"[login] cookie check skipped: {e}", file=sys.stderr)
+
+    def _has_sso_cookie(self) -> bool:
+        try:
+            cookies = self._ctx.cookies("https://grok.com")
+            return any(c.get("name") in ("sso", "sso-rw") for c in cookies)
+        except Exception:
+            return False
 
     def _is_alive(self):
         """Return True if the page/context is still usable."""
@@ -152,6 +168,32 @@ class GrokCloak:
         time.sleep(2)
         self._launch()
         print("[recover] Browser rebuilt", file=sys.stderr)
+
+    def acquire(self, timeout_s: float = 2.0, mark_busy: bool = True) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self._lock.acquire(blocking=False):
+                if mark_busy:
+                    self._busy_since = time.time()
+                return True
+            time.sleep(0.05)
+        return False
+
+    def release(self, mark_busy: bool = True):
+        if mark_busy:
+            self._busy_since = None
+        self._lock.release()
+
+    def health_snapshot(self) -> dict:
+        return {
+            "status": "busy" if self._busy_since else "ok",
+            "version": VERSION,
+            "code_rev": 4,
+            "url": self._last_url,
+            "logged_in": self._cookie_session_ready,
+            "busy_since": self._busy_since,
+            "last_error": self._last_error,
+        }
 
     def _auto_login_if_needed(self):
         """Navigate to grok.com and check login state. React needs time to hydrate — wait properly."""
@@ -213,16 +255,22 @@ class GrokCloak:
             print(f"[login] Login check error: {e}", file=sys.stderr)
 
     def _ensure_grok(self):
+        print(f"[ensure] current_url={self._page.url}", file=sys.stderr, flush=True)
         if not self._page.url.startswith(GROK_URL):
+            print("[ensure] navigating to grok.com", file=sys.stderr, flush=True)
             self._page.goto(GROK_URL, wait_until="domcontentloaded", timeout=15000)
+            print(f"[ensure] navigated_url={self._page.url}", file=sys.stderr, flush=True)
             self._page.wait_for_timeout(2000)
+        self._last_url = self._page.url
         # Re-check login every 10 minutes
         now = time.time()
         if now - self._last_login_check > 600:
             self._last_login_check = now
+            print("[ensure] checking login", file=sys.stderr, flush=True)
             if not self.is_logged_in():
                 print("[login] Session expired — re-attempting login", file=sys.stderr)
                 self._auto_login_if_needed()
+            print(f"[ensure] login_checked url={self._page.url}", file=sys.stderr, flush=True)
 
     def is_logged_in(self):
         try:
@@ -284,46 +332,96 @@ class GrokCloak:
             () => {
                 window.__grok_response = '';
                 window.__grok_done = false;
-                // Install the fetch interceptor only ONCE per page — re-injecting on every
-                // chat() call stacks wrappers and captures each token N times (triplication).
+                window.__grok_urls = [];  // debug
+                window.__grok_raw = [];   // debug: raw stream samples
                 if (window.__grok_hooked) { return; }
                 window.__grok_hooked = true;
                 const origFetch = window.fetch;
                 window.fetch = async function(...args) {
                     const resp = await origFetch(...args);
                     const url = (args[0] || '').toString();
-                    if (url.includes('/rest/app-chat') || url.includes('/rest/chat') || url.includes('/api/')) {
-                        try {
-                            const clone = resp.clone();
-                            const reader = clone.body.getReader();
-                            const decoder = new TextDecoder();
-                            (async () => {
-                                while(true) {
-                                    const {done, value} = await reader.read();
-                                    if (done) { window.__grok_done = true; break; }
-                                    const chunk = decoder.decode(value);
-                                    chunk.split('\\n').forEach(line => {
-                                        line = line.trim();
-                                        if (!line) return;
-                                        try {
-                                            const d = JSON.parse(line);
-                                            const t = d?.result?.response?.token
-                                                   || d?.result?.token
-                                                   || d?.token
-                                                   || d?.choices?.[0]?.delta?.content
-                                                   || '';
-                                            // Skip thinking-trace placeholder and consecutive
-                                            // duplicate tokens (Grok emits each token twice).
-                                            if (t && t !== window.__grok_last
-                                                  && t.indexOf('Thinking about your request') === -1) {
-                                                window.__grok_response += t;
-                                                window.__grok_last = t;
+                    const hostname = (() => { try { return new URL(url, location.href).hostname; } catch(e) { return ''; } })();
+                    const isGrokAPI = hostname === 'grok.com' || hostname.endsWith('.grok.com')
+                        || hostname === 'x.ai' || hostname.endsWith('.x.ai')
+                        || (url.startsWith('/') && (url.includes('chat') || url.startsWith('/rest/') || url.startsWith('/api/')));
+                    if (isGrokAPI) {
+                        window.__grok_urls.push(url);  // debug log
+                        // Skip suggestions stream — that's UI chips, not the real response
+                        const isSuggestion = url.includes('/suggestions/') || url.includes('/typeahead');
+                        // Target: only the response-node streaming endpoint
+                        const isResponseStream = url.includes('response-node');
+                        const contentType = resp.headers.get('content-type') || '';
+                        const isStream = contentType.includes('text/event-stream')
+                            || contentType.includes('application/x-ndjson')
+                            || contentType.includes('text/plain');
+                        if (!isSuggestion && (isResponseStream || isStream || url.includes('chat'))) {
+                            try {
+                                const clone = resp.clone();
+                                const reader = clone.body.getReader();
+                                const decoder = new TextDecoder();
+                                let buf = '';
+                                let tokenCount = 0;
+                                (async () => {
+                                    try {
+                                        while(tokenCount < 5000) {
+                                            const {done, value} = await reader.read();
+                                            if (done) {
+                                                // Flush remaining buffer
+                                                const lines = buf.split('\\n');
+                                                for (const line of lines) {
+                                                    const trimmed = line.trim();
+                                                    if (!trimmed || !trimmed.startsWith('{')) continue;
+                                                    try {
+                                                        const d = JSON.parse(trimmed);
+                                                        // Grok response-node token formats
+                                                        const t = d?.result?.response?.token
+                                                               || d?.result?.token
+                                                               || d?.token
+                                                               || d?.choices?.[0]?.delta?.content
+                                                               || d?.data
+                                                               || '';
+                                                        if (t && typeof t === 'string' && t !== window.__grok_last && t.length > 0
+                                                              && t.indexOf('Thinking') === -1) {
+                                                            window.__grok_response += t;
+                                                            window.__grok_last = t;
+                                                            tokenCount++;
+                                                        }
+                                                    } catch(e) {}
+                                                }
+                                                window.__grok_done = true;
+                                                break;
                                             }
-                                        } catch(e) {}
-                                    });
-                                }
-                            })();
-                        } catch(e) {}
+                                            buf += decoder.decode(value, {stream: true});
+                                            // Save raw chunk sample for debugging JSON format (only first 5 samples)
+                                            if (window.__grok_raw.length < 5 && buf.length > 50) {
+                                                window.__grok_raw.push({url: url, sample: buf.slice(0, 3000)});
+                                            }
+                                            const lines = buf.split('\\n');
+                                            buf = lines.pop() || '';
+                                            for (const line of lines) {
+                                                const trimmed = line.trim();
+                                                if (!trimmed || !trimmed.startsWith('{')) continue;                                                    try {
+                                                        const d = JSON.parse(trimmed);
+                                                        const t = d?.result?.response?.token
+                                                               || d?.result?.token
+                                                               || d?.token
+                                                               || d?.choices?.[0]?.delta?.content
+                                                               || d?.data
+                                                               || '';
+                                                        if (t && typeof t === 'string' && t !== window.__grok_last && t.length > 0
+                                                              && t.indexOf('Thinking') === -1) {
+                                                            window.__grok_response += t;
+                                                            window.__grok_last = t;
+                                                            tokenCount++;
+                                                        }
+                                                    } catch(e) {}
+                                            }
+                                        }
+                                        window.__grok_done = true;
+                                    } catch(e) { window.__grok_done = true; }
+                                })();
+                            } catch(e) {}
+                        }
                     }
                     return resp;
                 };
@@ -374,24 +472,54 @@ class GrokCloak:
             pass
         self._page.wait_for_timeout(2000)
 
+        # Wait briefly for SSE capture, but don't block if it's not working
+        try:
+            self._page.wait_for_function(
+                "() => window.__grok_done === true || (window.__grok_response || '').length > 50",
+                timeout=5000,
+            )
+        except:
+            pass
+        self._page.wait_for_timeout(500)
+
         text = self._page.evaluate("() => window.__grok_response || ''")
         if not text or len(text) < 5:
             text = self._page.evaluate("""
                 (userPrompt) => {
+                    // Try to find the last assistant message bubble first
+                    const msgBlocks = document.querySelectorAll('[data-testid="message"], [data-message-role="assistant"], .message-assistant, [class*="assistant"]');
+                    if (msgBlocks.length > 0) {
+                        const lastMsg = msgBlocks[msgBlocks.length - 1].textContent.trim();
+                        if (lastMsg.length > 5) return lastMsg.slice(0, 4000);
+                    }
+                    // Fallback: TreeWalker but filter out Grok UI suggestions
                     const main = document.querySelector('main, [role="main"], .conversation, #chat-content');
                     const root = main || document.body;
                     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                    const suggestionPatterns = [
+                        'Explore ', 'Learn about ', 'Discover ', 'Try asking',
+                        'Explain how', 'Find out', 'See also', 'Suggested',
+                        'Compare ', 'Summarize', 'Ask a follow', 'DeepSearch',
+                        'Think Harder', 'Attach', 'Ask anything', 'Search the web'
+                    ];
                     const texts = [];
                     let node;
                     while(node = walker.nextNode()) {
                         const t = node.textContent.trim();
-                        if (t.length > 20) texts.push(t);
+                        if (t.length < 20) continue;
+                        if (suggestionPatterns.some(p => t.startsWith(p))) continue;
+                        texts.push(t);
                     }
                     const idx = texts.findIndex(t => t.includes(userPrompt.slice(0, 20)));
                     if (idx >= 0 && idx < texts.length - 1) {
-                        return texts.slice(idx + 1).join(' ').slice(0, 4000);
+                        // Only take the first few texts after the prompt (the actual response)
+                        const after = texts.slice(idx + 1);
+                        // Stop at the first suggestion-like text
+                        const cutoff = after.findIndex(t => suggestionPatterns.some(p => t.startsWith(p)));
+                        const response = cutoff > 0 ? after.slice(0, cutoff) : after.slice(0, 5);
+                        return response.join(' ').slice(0, 4000);
                     }
-                    return texts.slice(-30).join(' ').slice(0, 4000);
+                    return texts.slice(-5).join(' ').slice(0, 4000);
                 }
             """, prompt)
 
@@ -399,17 +527,37 @@ class GrokCloak:
 
     def generate_image(self, prompt: str, size: str = "1024x1024") -> list[dict]:
         """Generate image via Grok Aurora (browser UI)."""
-        self._ensure_grok()
+        deadline = time.monotonic() + int(os.environ.get("GROK_IMAGE_TIMEOUT_S", "45"))
+        try:
+            self._ensure_grok()
+        except Exception as e:
+            self._last_error = f"ensure_grok: {e}"
+            return [{"url": "", "error": self._last_error}]
 
-        # Navigate to new chat or image mode
-        aurora_btn = self._page.query_selector('[aria-label*="Aurora"], [data-testid*="aurora"], text=Aurora')
+        # Navigate to image mode if a stable button is exposed. Do not click a
+        # broad text locator here: in headless Grok it can resolve to hidden
+        # navigation text and hang until Playwright's long default timeout.
+        aurora_btn = None
+        for sel in ('[aria-label*="Aurora"]', '[data-testid*="aurora"]'):
+            try:
+                aurora_btn = self._page.query_selector(sel)
+                if aurora_btn:
+                    break
+            except Exception:
+                pass
         if aurora_btn:
-            aurora_btn.click()
-            self._page.wait_for_timeout(1500)
+            try:
+                aurora_btn.click(timeout=2000)
+                self._page.wait_for_timeout(1500)
+            except Exception:
+                pass
 
         # Inject interceptor for image URLs
-        self._page.evaluate("""
+        try:
+            self._page.evaluate("""
             () => {
+                if (window.__grok_image_interceptor_installed) return;
+                window.__grok_image_interceptor_installed = true;
                 window.__grok_images = [];
                 const origFetch = window.fetch;
                 window.fetch = async function(...args) {
@@ -427,7 +575,10 @@ class GrokCloak:
                     return resp;
                 };
             }
-        """)
+            """)
+        except Exception as e:
+            self._last_error = f"image_interceptor: {e}"
+            return [{"url": "", "error": self._last_error}]
 
         img_prompt = f"Generate an image: {prompt}"
         box = None
@@ -439,15 +590,20 @@ class GrokCloak:
             except:
                 continue
         if not box:
-            return []
+            self._last_error = "textbox not found"
+            return [{"url": "", "error": self._last_error}]
 
-        box.click()
-        box.type(img_prompt, delay=20)
-        self._page.keyboard.press("Enter")
+        try:
+            box.click(timeout=3000)
+            box.type(img_prompt, delay=20)
+            self._page.keyboard.press("Enter")
+        except Exception as e:
+            self._last_error = f"submit_image_prompt: {e}"
+            return [{"url": "", "error": self._last_error}]
 
         # Wait for image to appear
-        for _ in range(20):
-            self._page.wait_for_timeout(3000)
+        while time.monotonic() < deadline:
+            self._page.wait_for_timeout(1500)
             # Check for generated image in DOM
             img_el = self._page.query_selector('img[src*="grok"], img[src*="aurora"], img[alt*="Generated"]')
             if img_el:
@@ -469,7 +625,8 @@ class GrokCloak:
         except:
             pass
 
-        return [{"url": "", "error": "image not captured — Aurora may need manual trigger"}]
+        self._last_error = "image generation timed out before capture"
+        return [{"url": "", "error": self._last_error}]
 
     def close(self):
         try:
@@ -482,6 +639,7 @@ class GrokCloak:
 
 class _Handler(BaseHTTPRequestHandler):
     bridge: GrokCloak = None
+    bridge_status = {"state": "starting", "error": None, "started_at": None}
 
     def log_message(self, fmt, *args):
         print(f'[{self.address_string()}] ' + fmt % args, file=sys.stderr)
@@ -499,17 +657,40 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._json(200, {
-                "status": "ok",
-                "version": VERSION,
-                "url": self.bridge._page.url if self.bridge else "?",
-                "logged_in": self.bridge.is_logged_in() if self.bridge else False,
-            })
+            if not self.bridge:
+                return self._json(200, {
+                    "status": self.bridge_status.get("state", "starting"),
+                    "version": VERSION,
+                    "code_rev": 5,
+                    "url": "about:blank",
+                    "logged_in": False,
+                    "busy_since": None,
+                    "started_at": self.bridge_status.get("started_at"),
+                    "last_error": self.bridge_status.get("error"),
+                })
+            self._json(200, self.bridge.health_snapshot())
+        elif self.path == "/health-debug":
+            if self.bridge:
+                if not self.bridge.acquire(timeout_s=0.25):
+                    return self._json(423, {"error": "browser busy", "busy_since": self.bridge._busy_since})
+                try:
+                    raw = self.bridge._page.evaluate("() => (window.__grok_raw || []).slice(0, 3)")
+                    urls = self.bridge._page.evaluate("() => (window.__grok_urls || []).slice(-10)")
+                    self._json(200, {"raw_samples": raw, "recent_urls": urls})
+                except Exception as e:
+                    self._json(500, {"error": str(e)})
+                finally:
+                    self.bridge.release()
+            else:
+                self._json(503, {"error": "bridge not ready"})
         elif self.path in ("/v1/models", "/models"):
             self._json(200, {"object": "list", "data": [
-                {"id": "grok-4.3", "object": "model"},
                 {"id": "grok-browser", "object": "model"},
+                {"id": "grok-4.3", "object": "model"},
                 {"id": "supergrok", "object": "model"},
+                {"id": "grok-build", "object": "model"},
+                {"id": "grok-code-fast-1", "object": "model"},
+                {"id": "grok-composer-2.5-fast", "object": "model"},
             ]})
         else:
             self._json(404, {"error": "not found"})
@@ -517,14 +698,25 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
+        if self.path in ("/chat", "/v1/chat/completions", "/chat/completions", "/v1/images/generations", "/images/generations") and not self.bridge:
+            return self._json(503, {
+                "error": "bridge not ready",
+                "status": self.bridge_status.get("state", "starting"),
+                "detail": self.bridge_status.get("error"),
+            })
 
         # Legacy /chat endpoint
         if self.path == "/chat":
             prompt = body.get("prompt")
             if not prompt:
                 return self._json(400, {"error": "missing 'prompt' field"})
-            result = self.bridge.chat(prompt, body.get("mode", "auto"))
-            return self._json(200, result)
+            if not self.bridge.acquire(timeout_s=2):
+                return self._json(423, {"error": "browser busy", "busy_since": self.bridge._busy_since})
+            try:
+                result = self.bridge.chat(prompt, body.get("mode", "auto"))
+                return self._json(200, result)
+            finally:
+                self.bridge.release()
 
         # OpenAI-compatible chat
         if self.path in ("/v1/chat/completions", "/chat/completions"):
@@ -543,9 +735,14 @@ class _Handler(BaseHTTPRequestHandler):
                 elif role == "assistant":
                     prompt_parts.append(f"[Assistant]: {content}")
             prompt = "\n".join(prompt_parts)
-            result = self.bridge.chat(prompt)
-            if result.get("status") == "error":
-                return self._json(502, result)
+            if not self.bridge.acquire(timeout_s=2):
+                return self._json(423, {"error": "browser busy", "busy_since": self.bridge._busy_since})
+            try:
+                result = self.bridge.chat(prompt)
+                if result.get("status") == "error":
+                    return self._json(502, result)
+            finally:
+                self.bridge.release()
             text = result.get("response", "")
             return self._json(200, {
                 "id": f"chatcmpl-grok-{int(time.time())}",
@@ -566,7 +763,12 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "missing prompt"})
             size = body.get("size", "1024x1024")
             response_format = body.get("response_format", "url")
-            images = self.bridge.generate_image(prompt, size=size)
+            if not self.bridge.acquire(timeout_s=5):
+                return self._json(423, {"error": "browser busy", "busy_since": self.bridge._busy_since})
+            try:
+                images = self.bridge.generate_image(prompt, size=size)
+            finally:
+                self.bridge.release()
             if not images:
                 return self._json(502, {"error": "image generation failed"})
             return self._json(200, {
@@ -593,19 +795,32 @@ def login_mode():
 
 
 def server_mode(host: str, port: int, headless: bool):
-    bridge = GrokCloak(headless=headless)
-    _Handler.bridge = bridge
+    _Handler.bridge = None
+    _Handler.bridge_status = {"state": "starting", "error": None, "started_at": time.time()}
+
+    def _launch_bridge():
+        try:
+            _Handler.bridge = GrokCloak(headless=headless)
+            _Handler.bridge_status = {"state": "ready", "error": None, "started_at": _Handler.bridge_status["started_at"]}
+        except Exception as e:
+            _Handler.bridge = None
+            _Handler.bridge_status = {"state": "error", "error": str(e), "started_at": _Handler.bridge_status["started_at"]}
+            print(f"[FATAL] bridge launch failed: {e}", file=sys.stderr, flush=True)
+
+    threading.Thread(target=_launch_bridge, daemon=True, name="grok-bridge-launch").start()
 
     def _shutdown(sig, _):
         print("\n[SIGNAL] Shutting down...", file=sys.stderr)
-        bridge.close()
+        if _Handler.bridge:
+            _Handler.bridge.close()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    HTTPServer.allow_reuse_address = True  # survive fast restarts (TIME_WAIT)
-    srv = HTTPServer((host, port), _Handler)
+    ThreadingHTTPServer.allow_reuse_address = True  # survive fast restarts (TIME_WAIT)
+    ThreadingHTTPServer.daemon_threads = True
+    srv = ThreadingHTTPServer((host, port), _Handler)
     print(f"grok-cloak-bridge {VERSION} listening on {host}:{port}", file=sys.stderr)
     srv.serve_forever()
 

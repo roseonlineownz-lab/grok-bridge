@@ -653,20 +653,28 @@ class GrokBridge:
             return {"status": "error", "error": str(e), "query": prompt, "mode": mode}
 
     async def health(self) -> dict:
-        profile = await self._pool.get_healthy_session()
-        pid = profile["id"]
-        try:
-            url = profile["page"].url
-            await self._pool.reward(pid)
-            return {
-                "status": "ok",
+        profiles = []
+        for profile in self._pool.profiles:
+            page = profile.get("page")
+            url = getattr(page, "url", "") if page else ""
+            profiles.append({
+                "id": profile["id"],
+                "health": profile["health"],
+                "in_use": profile["in_use"],
+                "ready": bool(page),
                 "url": url,
                 "on_grok": url.startswith(GROK_URL),
-                "version": VERSION,
-            }
-        except Exception as e:
-            self._pool.penalize(pid, penalty=10)
-            return {"status": "error", "error": str(e), "version": VERSION}
+            })
+        browser_ready = self._pool._browser is not None
+        ready_profiles = sum(1 for profile in profiles if profile["ready"])
+        return {
+            "status": "ok" if browser_ready else "starting",
+            "version": VERSION,
+            "browser_ready": browser_ready,
+            "ready_profiles": ready_profiles,
+            "pool_size": len(profiles),
+            "profiles": profiles,
+        }
 
     async def history(self) -> dict:
         profile = await self._pool.get_healthy_session()
@@ -720,7 +728,7 @@ def _json(data: dict, status: int = 200) -> web.Response:
 
 
 class BridgeServer:
-    def __init__(self, host: str = "0.0.0.0", port: int = 19998, headless: bool = False):
+    def __init__(self, host: str = "127.0.0.1", port: int = 19998, headless: bool = False):
         self._host = host
         self._port = port
         self._headless = headless
