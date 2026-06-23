@@ -94,6 +94,27 @@ class GrokCloak:
     def _launch(self):
         """Launch (or relaunch) the persistent browser context and primary page."""
         _clear_crash_recovery()
+        # Stable mode: attach to the already-running CloakBrowser (managed by
+        # nova-cloakserve) over CDP instead of launching a SECOND persistent
+        # context on the same profile. A second full browser on the shared
+        # grok_cloak profile causes the ProcessSingleton lock conflict AND the
+        # duplicate-renderer OOM storm (hundreds of chrome tasks). Reusing the
+        # single managed instance keeps memory flat. Opt in via GROK_CDP_URL.
+        cdp_url = os.environ.get("GROK_CDP_URL", "").strip()
+        if cdp_url:
+            from playwright.sync_api import sync_playwright
+            print(f"[CloakBrowser] Attaching via CDP {cdp_url}", file=sys.stderr)
+            if not getattr(self, "_pw", None):
+                self._pw = sync_playwright().start()
+            browser = self._pw.chromium.connect_over_cdp(cdp_url, timeout=20000)
+            self._cdp_browser = browser
+            self._ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            self._page = self._ctx.new_page()
+            self._page.set_default_timeout(int(os.environ.get("GROK_PLAYWRIGHT_TIMEOUT_MS", "12000")))
+            self._page.set_default_navigation_timeout(int(os.environ.get("GROK_NAVIGATION_TIMEOUT_MS", "20000")))
+            self._last_login_check = 0
+            self._verify_session_cookies()
+            return
         _import_chrome_cookies()
         print(f"[CloakBrowser] Launching — headless={self._headless}", file=sys.stderr)
         # Optional egress proxy (e.g. residential SOCKS exit to pass Cloudflare on a
