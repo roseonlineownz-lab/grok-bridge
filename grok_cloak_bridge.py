@@ -113,6 +113,7 @@ class GrokCloak:
             self._page.set_default_timeout(int(os.environ.get("GROK_PLAYWRIGHT_TIMEOUT_MS", "12000")))
             self._page.set_default_navigation_timeout(int(os.environ.get("GROK_NAVIGATION_TIMEOUT_MS", "20000")))
             self._last_login_check = 0
+            self._inject_decrypted_cookies()
             self._verify_session_cookies()
             return
         _import_chrome_cookies()
@@ -136,7 +137,34 @@ class GrokCloak:
         # Lightweight init: verify SSO cookies WITHOUT loading the heavy grok.com SPA.
         # Loading grok.com at startup OOM-crashes the renderer on RAM-tight hosts;
         # the actual navigation is deferred to the first chat() via _ensure_grok().
+        self._inject_decrypted_cookies()
         self._verify_session_cookies()
+
+    def _inject_decrypted_cookies(self):
+        try:
+            import json
+            cookies_path = "/tmp/grok_cookies.json"
+            if os.path.exists(cookies_path):
+                with open(cookies_path) as f:
+                    decrypted_cookies = json.load(f)
+                formatted = []
+                for c in decrypted_cookies:
+                    c_formatted = {
+                        "name": c["name"],
+                        "value": c["value"],
+                        "domain": c.get("domain", ".grok.com"),
+                        "path": c.get("path", "/"),
+                        "secure": c.get("secure", True),
+                    }
+                    if "httpOnly" in c:
+                        c_formatted["httpOnly"] = c["httpOnly"]
+                    if "sameSite" in c and c["sameSite"] in ("Lax", "Strict", "None"):
+                        c_formatted["sameSite"] = c["sameSite"]
+                    formatted.append(c_formatted)
+                self._ctx.add_cookies(formatted)
+                print(f"[login] Loaded and injected {len(formatted)} decrypted cookies from {cookies_path}", file=sys.stderr)
+        except Exception as e:
+            print(f"[login] Failed to inject decrypted cookies: {e}", file=sys.stderr)
 
     def _verify_session_cookies(self):
         """Cheap login check: inspect persisted cookies, no page navigation."""
@@ -555,6 +583,131 @@ class GrokCloak:
             self._last_error = f"ensure_grok: {e}"
             return [{"url": "", "error": self._last_error}]
 
+    def _cdp_video_via_cloak(self, prompt, deadline):
+        import urllib.request, json as _json, websocket, time
+        try:
+            page_url = None
+            resp = urllib.request.urlopen("http://127.0.0.1:19222/json/list", timeout=5)
+            targets = _json.loads(resp.read())
+            for t in targets:
+                if "grok" in t.get("url", "").lower():
+                    page_url = t.get("webSocketDebuggerUrl")
+                    break
+            if not page_url:
+                resp = urllib.request.urlopen("http://127.0.0.1:19222/json/version", timeout=5)
+                browser_ws = _json.loads(resp.read())["webSocketDebuggerUrl"]
+                bws = websocket.create_connection(browser_ws, timeout=10, max_size=None, suppress_origin=True)
+                bws.send(_json.dumps({"id": 1, "method": "Target.createTarget", "params": {"url": "about:blank"}}))
+                r2 = _json.loads(bws.recv())
+                tid = r2["result"]["targetId"]
+                page_url = "ws://127.0.0.1:19222/devtools/page/%s" % tid
+                bws.close()
+        except Exception as e:
+            return [{"url": "", "error": "cloak: " + str(e)}]
+
+        try:
+            ws = websocket.create_connection(page_url, timeout=15, max_size=None, suppress_origin=True)
+        except Exception as e:
+            return [{"url": "", "error": "ws: " + str(e)}]
+
+        _mid = [0]
+        def cdp(method, params=None):
+            _mid[0] += 1
+            ws.send(_json.dumps({"id": _mid[0], "method": method, "params": params or {}}))
+            t0 = time.time()
+            while time.time() - t0 < 30:
+                ws.settimeout(5)
+                try:
+                    r = _json.loads(ws.recv())
+                    if r.get("id") == _mid[0]:
+                        return r
+                except:
+                    break
+            return {"error": "timeout"}
+
+        for domain in ["Network", "Runtime", "Page", "DOM"]:
+            r = cdp(domain + ".enable")
+            if "error" in r:
+                ws.close()
+                return [{"url": "", "error": "domain_" + domain + ": " + str(r.get("error", {}))}]
+
+        # Inject cookies from logged-in Playwright Chromium
+        try:
+            pw_ver = urllib.request.urlopen("http://127.0.0.1:19223/json/version", timeout=5)
+            pw_bws = _json.loads(pw_ver.read())["webSocketDebuggerUrl"]
+            pw_ws = websocket.create_connection(pw_bws, timeout=10, max_size=None, suppress_origin=True)
+            pw_mid = [0]
+            def pw_cdp(method, params=None):
+                pw_mid[0] += 1
+                pw_ws.send(_json.dumps({"id": pw_mid[0], "method": method, "params": params or {}}))
+                t0 = time.time()
+                while time.time() - t0 < 10:
+                    pw_ws.settimeout(3)
+                    try:
+                        r = _json.loads(pw_ws.recv())
+                        if r.get("id") == pw_mid[0]:
+                            return r
+                    except:
+                        break
+                return None
+            pw_cdp("Network.enable")
+            r = pw_cdp("Network.getCookies", {"urls": ["https://grok.com"]})
+            if r and "result" in r and "cookies" in r["result"]:
+                cookies = r["result"]["cookies"]
+                print("[video] Got %d cookies" % len(cookies), file=sys.stderr, flush=True)
+                for c in cookies:
+                    cdp("Network.setCookie", {
+                        "name": c["name"],"value": c["value"],
+                        "domain": c.get("domain",".grok.com"),"path": c.get("path","/"),
+                        "secure": c.get("secure",True),"httpOnly": c.get("httpOnly",False),
+                    })
+                print("[video] Injected %d cookies" % len(cookies), file=sys.stderr, flush=True)
+            pw_ws.close()
+        except Exception as e:
+            print("[video] cookie: %s" % e, file=sys.stderr, flush=True)
+
+        r = cdp("Page.navigate", {"url": "https://grok.com"})
+        if "error" in r:
+            ws.close()
+            return [{"url": "", "error": "nav: " + str(r.get("error",{}))}]
+
+        tl = time.time() + 25
+        while time.time() < tl:
+            r = cdp("Runtime.evaluate", {"expression":"document.readyState","returnByValue":True})
+            st = r.get("result",{}).get("result",{}).get("value","")
+            if st in ("complete","interactive"): break
+            time.sleep(2)
+        time.sleep(3)
+
+        cdp("Runtime.evaluate", {"expression":'(()=>{if(window.__gvcdp)return;window.__gvcdp=1;window.__gv=[];const of=window.fetch.bind(window);window.fetch=(...a)=>of(...a).then(r=>{try{r.clone().json().then(d=>{const u=JSON.stringify(d).match(/https?:[^"\]+\.(?:mp4|webm|mov)[^"]*/gi);if(u)window.__gv.push(...u)}).catch(()=>{})}catch(e){}return r})})()'})
+
+        found = False
+        for _ in range(8):
+            r = cdp("Runtime.evaluate",{"expression":'(()=>{var s=["div[contenteditable=\"true\"]","[role=\"textbox\"]"];for(var x of s){var e=document.querySelector(x);if(e&&e.offsetParent!==null){e.focus();return true}}return false})()',"returnByValue":True})
+            if r.get("result",{}).get("result",{}).get("value",False): found=True; break
+            time.sleep(2)
+        if not found:
+            ws.close()
+            return [{"url":"","error":"no_input_box"}]
+
+        cdp("Input.insertText",{"text":"Generate a video: "+prompt})
+        time.sleep(0.3)
+        cdp("Input.dispatchKeyEvent",{"type":"rawKeyDown","key":"Enter"})
+        cdp("Input.dispatchKeyEvent",{"type":"keyUp","key":"Enter"})
+
+        while time.monotonic() < deadline:
+            time.sleep(3)
+            r = cdp("Runtime.evaluate",{"expression":'(()=>{var v=document.querySelector("video source[src],video[src]");if(v&&v.src)return{v:v.src||v.getAttribute("src")||""};var a=document.querySelector("a[href$=".mp4"]");if(a)return{v:a.href||""};var arr=window.__gv||[];if(arr.length)return{v:arr[0]};return null})()',"returnByValue":True})
+            res = r.get("result",{}).get("result",{}).get("value",None)
+            if res and res.get("v"): ws.close(); return [{"url":res["v"]}]
+
+        ws.close()
+        return [{"url":"","error":"timed out"}]
+
+    def generate_video(self, prompt, resolution="720p", duration=10):
+        deadline = time.monotonic() + 180
+        return self._cdp_video_via_cloak(prompt, deadline)
+
         # Navigate to image mode if a stable button is exposed. Do not click a
         # broad text locator here: in headless Grok it can resolve to hidden
         # navigation text and hang until Playwright's long default timeout.
@@ -816,19 +969,15 @@ def login_mode():
 
 
 def server_mode(host: str, port: int, headless: bool):
-    _Handler.bridge = None
     _Handler.bridge_status = {"state": "starting", "error": None, "started_at": time.time()}
 
-    def _launch_bridge():
-        try:
-            _Handler.bridge = GrokCloak(headless=headless)
-            _Handler.bridge_status = {"state": "ready", "error": None, "started_at": _Handler.bridge_status["started_at"]}
-        except Exception as e:
-            _Handler.bridge = None
-            _Handler.bridge_status = {"state": "error", "error": str(e), "started_at": _Handler.bridge_status["started_at"]}
-            print(f"[FATAL] bridge launch failed: {e}", file=sys.stderr, flush=True)
-
-    threading.Thread(target=_launch_bridge, daemon=True, name="grok-bridge-launch").start()
+    try:
+        _Handler.bridge = GrokCloak(headless=headless)
+        _Handler.bridge_status = {"state": "ready", "error": None, "started_at": _Handler.bridge_status["started_at"]}
+    except Exception as e:
+        _Handler.bridge = None
+        _Handler.bridge_status = {"state": "error", "error": str(e), "started_at": _Handler.bridge_status["started_at"]}
+        print(f"[FATAL] bridge launch failed: {e}", file=sys.stderr, flush=True)
 
     def _shutdown(sig, _):
         print("\n[SIGNAL] Shutting down...", file=sys.stderr)
@@ -839,9 +988,9 @@ def server_mode(host: str, port: int, headless: bool):
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    ThreadingHTTPServer.allow_reuse_address = True  # survive fast restarts (TIME_WAIT)
-    ThreadingHTTPServer.daemon_threads = True
-    srv = ThreadingHTTPServer((host, port), _Handler)
+    from http.server import HTTPServer
+    HTTPServer.allow_reuse_address = True  # survive fast restarts (TIME_WAIT)
+    srv = HTTPServer((host, port), _Handler)
     print(f"grok-cloak-bridge {VERSION} listening on {host}:{port}", file=sys.stderr)
     srv.serve_forever()
 
