@@ -8,6 +8,9 @@ Endpoints:
 - /v1/chat/completions
 - /v1/images/generations
 - /v1/audio/speech
+- /v1/videos/generations      (puter-video-generation: sora-2/veo-3 via Puter)
+- /v1/audio/transcriptions    (puter-speech2txt: xAI STT via Puter)
+- /v1/images/describe         (puter-ocr: vision/OCR via Puter)
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ ENV_PATH = os.path.expanduser("~/.config/novamaster/puter.env")
 PUTER_API = "https://api.puter.com/drivers/call"
 DEFAULT_MODEL = os.environ.get("PUTER_DEFAULT_MODEL", "x-ai/grok-4.3")
 DEFAULT_IMAGE_MODEL = os.environ.get("PUTER_DEFAULT_IMAGE_MODEL", "gpt-image-1.5")
+REASONING_MIN_MAX_TOKENS = int(os.environ.get("PUTER_REASONING_MIN_MAX_TOKENS", "256"))
 
 GROK_TEXT_MODELS = [
     "x-ai/grok-build-0.1",
@@ -61,6 +65,30 @@ GENERAL_TEXT_MODELS = [
     "gemini-2.5-flash",
 ]
 
+ZAI_TEXT_MODELS = [
+    "z-ai/glm-5.2",
+    "z-ai/glm-5.1",
+    "z-ai/glm-5v-turbo",
+    "z-ai/glm-5-turbo",
+    "z-ai/glm-5",
+    "z-ai/glm-4.7",
+    "z-ai/glm-4.7-flash",
+    "z-ai/glm-4.7-flashx",
+    "z-ai/glm-4.6v",
+    "z-ai/glm-4.6v-flash",
+    "z-ai/glm-4.6v-flashx",
+    "z-ai/glm-4.6",
+    "z-ai/glm-4.5",
+    "z-ai/glm-4.5-air",
+    "z-ai/glm-4.5-airx",
+    "z-ai/glm-4.5-flash",
+    "z-ai/glm-4.5-x",
+    "z-ai/glm-4.5v",
+    "z-ai/glm-4-32b",
+    "z-ai/glm-4-32b-0414-128k",
+    "z-ai/autoglm-phone-multilingual",
+]
+
 IMAGE_MODELS = [
     "grok-2-image",
     "grok-image",
@@ -84,6 +112,18 @@ MODEL_ALIASES = {
     "grok-fast": "x-ai/grok-4-1-fast",
     "grok-code": "x-ai/grok-build-0.1",
     "grok-build": "x-ai/grok-build-0.1",
+    "glm": "z-ai/glm-5.2",
+    "glm-5.2": "z-ai/glm-5.2",
+    "glm5.2": "z-ai/glm-5.2",
+    "glm52": "z-ai/glm-5.2",
+    "glm-5-2": "z-ai/glm-5.2",
+    "zai-org-glm-5-2": "z-ai/glm-5.2",
+    "zai-org/GLM-5.2": "z-ai/glm-5.2",
+    "glm-5.1": "z-ai/glm-5.1",
+    "glm5.1": "z-ai/glm-5.1",
+    "glm-5v": "z-ai/glm-5v-turbo",
+    "glm-5v-turbo": "z-ai/glm-5v-turbo",
+    "glm-5-turbo": "z-ai/glm-5-turbo",
 }
 
 IMAGE_ALIASES = {
@@ -188,9 +228,15 @@ def _resolve_image_model(model: Any) -> str:
 def _chat_driver_for(model: str) -> str | None:
     if model.startswith("x-ai/"):
         return "ai-chat"
+    if model.startswith("z-ai/"):
+        return "ai-chat"
     if model.startswith("openrouter:"):
         return "openrouter"
     return None
+
+
+def _is_reasoning_model(model: str) -> bool:
+    return model.startswith("z-ai/glm-5") or model.startswith("z-ai/glm-4.7")
 
 
 def _image_driver_for(model: str, provider: str | None) -> str:
@@ -241,6 +287,16 @@ def _puter_complete(body: dict[str, Any]) -> tuple[dict[str, Any] | None, str | 
     ):
         if key in body and body[key] is not None:
             args[key] = body[key]
+    if _is_reasoning_model(model):
+        current_max = args.get("max_tokens")
+        if current_max is None:
+            args["max_tokens"] = REASONING_MIN_MAX_TOKENS
+        else:
+            try:
+                if int(current_max) < REASONING_MIN_MAX_TOKENS:
+                    args["max_tokens"] = REASONING_MIN_MAX_TOKENS
+            except (TypeError, ValueError):
+                args["max_tokens"] = REASONING_MIN_MAX_TOKENS
 
     result, error, _ = _puter_call(
         "puter-chat-completion",
@@ -266,7 +322,11 @@ def _image_result_item(value: Any, response_format: str) -> dict[str, Any]:
             if value.startswith("data:") and "," in value:
                 return {"b64_json": value.split(",", 1)[1]}
             try:
-                decoded = urllib.request.urlopen(value, timeout=30).read()
+                request = urllib.request.Request(
+                    value,
+                    headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36"},
+                )
+                decoded = urllib.request.urlopen(request, timeout=30).read()
                 return {"b64_json": base64.b64encode(decoded).decode("ascii")}
             except Exception:
                 return {"url": value}
@@ -323,6 +383,99 @@ def _puter_image(body: dict[str, Any]) -> tuple[list[dict[str, Any]] | None, str
     return [_image_result_item(value, response_format) for value in values], None
 
 
+def _puter_video(body: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Video generation via puter-video-generation. Returns a downloadable URL."""
+    prompt = body.get("prompt") or body.get("input")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None, "missing prompt"
+    args: dict[str, Any] = {
+        "prompt": prompt,
+        "model": body.get("model", "sora-2"),
+        "seconds": body.get("seconds", 5),
+    }
+    if body.get("size"):
+        args["size"] = body["size"]
+    if body.get("aspect_ratio"):
+        args["aspect_ratio"] = body["aspect_ratio"]
+    if body.get("test_mode") is not None:
+        args["test_mode"] = bool(body["test_mode"])
+
+    result, error, _ = _puter_call(
+        "puter-video-generation",
+        "generate",
+        args,
+        driver="ai-video",
+        test_mode=args.get("test_mode"),
+        timeout=300,
+    )
+    if error:
+        return None, error
+    if isinstance(result, dict):
+        url = result.get("url") or result.get("src") or (result.get("result") if isinstance(result.get("result"), str) else None)
+    elif isinstance(result, str):
+        url = result
+    else:
+        return None, f"unexpected video response: {str(result)[:200]}"
+    if not url:
+        return None, "video result had no url"
+    return url, None
+
+
+def _puter_transcribe(body: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Speech-to-text via puter-speech2txt. Accepts audio as data-URI/base64 in `audio` or `file`."""
+    source = body.get("audio") or body.get("file") or body.get("input")
+    if not source:
+        return None, "missing audio (send data URI / base64 in 'audio')"
+    args: dict[str, Any] = {"file": source}
+    for key in ("provider", "language", "format", "translate"):
+        if body.get(key) is not None:
+            args[key] = body[key]
+    if body.get("test_mode") is not None:
+        args["test_mode"] = bool(body["test_mode"])
+
+    result, error, _ = _puter_call(
+        "puter-speech2txt",
+        "transcribe",
+        args,
+        driver="ai-speech2txt",
+        test_mode=args.get("test_mode"),
+        timeout=180,
+    )
+    if error:
+        return None, error
+    if isinstance(result, dict):
+        return result, None
+    return {"text": str(result)}, None
+
+
+def _puter_describe(body: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Vision/OCR via puter-ocr. Accepts an image as data-URI/base64 in `image` or `source`."""
+    source = body.get("image") or body.get("source") or body.get("input")
+    if not source:
+        return None, "missing image (send data URI / base64 in 'image')"
+    args: dict[str, Any] = {"source": source}
+    # NB: de ai-ocr driver accepteert GEEN provider-arg (xai -> 502).
+    # Alleen language doorgeven; provider wordt genegeerd.
+    if body.get("language") is not None:
+        args["language"] = body["language"]
+    if body.get("test_mode") is not None:
+        args["test_mode"] = bool(body["test_mode"])
+
+    result, error, _ = _puter_call(
+        "puter-ocr",
+        "recognize",
+        args,
+        driver="ai-ocr",
+        test_mode=args.get("test_mode"),
+        timeout=180,
+    )
+    if error:
+        return None, error
+    if isinstance(result, dict):
+        return result, None
+    return {"text": str(result)}, None
+
+
 def _puter_speech(body: dict[str, Any]) -> tuple[bytes | None, str | None, str]:
     text = body.get("input") or body.get("text")
     if not isinstance(text, str) or not text.strip():
@@ -341,11 +494,16 @@ def _puter_speech(body: dict[str, Any]) -> tuple[bytes | None, str | None, str]:
         if key in body and body[key] is not None:
             args[key] = body[key]
 
+    # xAI-voices (eve/ara/rex/sal/leo) draaien op de ai-tts driver; Polly-voices (Lotte/Maxim) ook.
+    # De oude "aws-polly" driver-diskriminator accepteert geen xai-voices — dus default naar ai-tts.
+    driver = body.get("driver")
+    if not isinstance(driver, str) or not driver:
+        driver = "ai-tts" if args.get("provider") in ("xai", "x-ai") or (isinstance(body.get("model"), str) and body["model"].startswith("x-ai/")) else "ai-tts"
     result, error, headers = _puter_call(
         "puter-tts",
         "synthesize",
         args,
-        driver=body.get("driver") if isinstance(body.get("driver"), str) else "aws-polly",
+        driver=driver,
         test_mode=body.get("test_mode") if "test_mode" in body else None,
         timeout=120,
         raw_response=True,
@@ -369,6 +527,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
         self.wfile.write(body)
 
@@ -376,8 +537,18 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.end_headers()
 
     def _read_json(self) -> dict[str, Any] | None:
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -424,11 +595,11 @@ class _Handler(BaseHTTPRequestHandler):
                     "version": VERSION,
                     "token": bool(TOKEN),
                     "default_model": DEFAULT_MODEL,
-                    "capabilities": ["chat", "chat_stream_single_chunk", "images", "audio_speech"],
+                    "capabilities": ["chat", "chat_stream_single_chunk", "images", "audio_speech", "video", "speech2txt", "ocr"],
                 },
             )
         if self.path == "/v1/models":
-            models = GROK_TEXT_MODELS + GENERAL_TEXT_MODELS + IMAGE_MODELS
+            models = GROK_TEXT_MODELS + GENERAL_TEXT_MODELS + ZAI_TEXT_MODELS + IMAGE_MODELS
             return self._json(
                 200,
                 {
@@ -478,6 +649,24 @@ class _Handler(BaseHTTPRequestHandler):
             if error:
                 return self._json(502, {"error": error})
             return self._bytes(200, audio or b"", content_type)
+
+        if self.path == "/v1/videos/generations":
+            url, error = _puter_video(body)
+            if error:
+                return self._json(502, {"error": error})
+            return self._json(200, {"created": int(time.time()), "data": [{"url": url}]})
+
+        if self.path == "/v1/audio/transcriptions":
+            result, error = _puter_transcribe(body)
+            if error:
+                return self._json(502, {"error": error})
+            return self._json(200, result or {})
+
+        if self.path == "/v1/images/describe":
+            result, error = _puter_describe(body)
+            if error:
+                return self._json(502, {"error": error})
+            return self._json(200, result or {})
 
         return self._json(404, {"error": "not found"})
 
